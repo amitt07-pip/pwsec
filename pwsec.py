@@ -59,6 +59,8 @@ allowed_chat = filters.create(_in_allowed_chat)
 _bot_id = None
 _tag_history = defaultdict(deque)
 _kickall_running = set()
+START_TIME = time.time()
+_stats = {"join_dms": 0, "tag_dms": 0, "filter_replies": 0, "groups_left": 0}
 
 
 def load_json(path: str, default):
@@ -278,6 +280,7 @@ async def handle_join_request(client: Client, join_request):
 
     try:
         await client.send_message(chat_id=user.id, text=text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
+        _stats["join_dms"] += 1
         print(f"Sent DM to {user.id} for join request to {chat.title}")
     except Exception as e:
         print(f"Could not DM user {user.id}: {e}")
@@ -623,6 +626,7 @@ async def handle_mention(client: Client, message: Message):
                 reply_markup=keyboard,
                 parse_mode=enums.ParseMode.HTML,
             )
+            _stats["tag_dms"] += 1
             print(f"Sent tag notification to {mentioned_user.id} from {chat.title}")
         except Exception as e:
             print(f"Could not send tag notification to {mentioned_user.id}: {e}")
@@ -659,9 +663,127 @@ async def reply_filters(client: Client, message: Message):
                     entities=entities or None,
                     parse_mode=enums.ParseMode.DISABLED,
                 )
+            _stats["filter_replies"] += 1
         except Exception as e:
             print(f"Could not send filter '{saved['trigger']}' in {message.chat.id}: {e}")
         return
+
+
+async def leave_chat(client: Client, chat) -> None:
+    try:
+        await client.leave_chat(chat.id)
+        _stats["groups_left"] += 1
+        print(f"Left non-allowed chat {chat.id} ({chat.title})")
+    except Exception as e:
+        print(f"Could not leave chat {chat.id}: {e}")
+
+
+@app.on_chat_member_updated(~allowed_chat, group=-1)
+async def leave_when_added(client: Client, update):
+    new = update.new_chat_member
+    if not new or not new.user or new.user.id != await get_bot_id(client):
+        return
+    if new.status in (enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.RESTRICTED):
+        await leave_chat(client, update.chat)
+
+
+@app.on_message((filters.group | filters.channel) & ~allowed_chat, group=-1)
+async def leave_other_groups(client: Client, message: Message):
+    await leave_chat(client, message.chat)
+
+
+@app.on_chat_join_request(~allowed_chat, group=-1)
+async def leave_on_join_request(client: Client, join_request):
+    await leave_chat(client, join_request.chat)
+
+
+def format_uptime(seconds: float) -> str:
+    seconds = int(seconds)
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{days}d {hours}h {minutes}m {seconds}s"
+
+
+def yes_no(value) -> str:
+    return "✅" if value else "❌"
+
+
+async def build_dashboard(client: Client) -> str:
+    started = time.monotonic()
+    await client.get_me()
+    ping_ms = (time.monotonic() - started) * 1000
+
+    group_lines = []
+    healthy = True
+    try:
+        chat = await client.get_chat(ALLOWED_CHAT_ID)
+        member = await client.get_chat_member(ALLOWED_CHAT_ID, await get_bot_id(client))
+        privileges = member.privileges
+        is_group_admin = member.status in ADMIN_STATUSES
+        healthy = is_group_admin and bool(privileges and privileges.can_restrict_members and privileges.can_invite_users)
+        group_lines = [
+            f"<b>• Name:</b> {html.escape(chat.title or '')}",
+            f"<b>• ID:</b> <code>{ALLOWED_CHAT_ID}</code>",
+            f"<b>• Bot is admin:</b> {yes_no(is_group_admin)}",
+            f"<b>• Ban users:</b> {yes_no(privileges and privileges.can_restrict_members)}",
+            f"<b>• Invite users / join requests:</b> {yes_no(privileges and privileges.can_invite_users)}",
+        ]
+    except Exception as e:
+        healthy = False
+        group_lines = [f"<b>• ID:</b> <code>{ALLOWED_CHAT_ID}</code>", f"❌ Can't access group: {html.escape(str(e))}"]
+
+    status = "✅ <b>Bot is working perfectly</b>" if healthy else "⚠️ <b>Bot is running, but needs attention</b>"
+    filter_count = len(_filters.get(str(ALLOWED_CHAT_ID), {}))
+
+    return "\n".join(
+        [
+            "<b><u>📊 Bot Dashboard</u></b>",
+            "",
+            status,
+            f"<b>• Uptime:</b> {format_uptime(time.time() - START_TIME)}",
+            f"<b>• Ping:</b> {ping_ms:.0f} ms",
+            "",
+            "<b>Allowed group</b>",
+            *group_lines,
+            "",
+            "<b>Data</b>",
+            f"<b>• Filters:</b> {filter_count}",
+            f"<b>• Bot admins:</b> {len(_bot_admins)} (+ owner)",
+            "",
+            "<b>Since start</b>",
+            f"<b>• Join request DMs:</b> {_stats['join_dms']}",
+            f"<b>• Tag DMs:</b> {_stats['tag_dms']}",
+            f"<b>• Filter replies:</b> {_stats['filter_replies']}",
+            f"<b>• Groups left:</b> {_stats['groups_left']}",
+            "",
+            f"<i>Updated {time.strftime('%Y-%m-%d %H:%M:%S')}</i>",
+        ]
+    )
+
+
+DASHBOARD_KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="dashboard:refresh")]])
+
+
+@app.on_message(filters.command("start") & filters.private)
+async def owner_dashboard(client: Client, message: Message):
+    """Owner-only status dashboard in the bot's DM"""
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return
+    await message.reply_text(await build_dashboard(client), reply_markup=DASHBOARD_KEYBOARD, parse_mode=enums.ParseMode.HTML)
+
+
+@app.on_callback_query(filters.regex(r"^dashboard:refresh$"))
+async def refresh_dashboard(client: Client, query: CallbackQuery):
+    if query.from_user.id != OWNER_ID:
+        await query.answer("This button isn't for you.", show_alert=True)
+        return
+    try:
+        await query.message.edit_text(await build_dashboard(client), reply_markup=DASHBOARD_KEYBOARD, parse_mode=enums.ParseMode.HTML)
+    except Exception as e:
+        if "MESSAGE_NOT_MODIFIED" not in str(e):
+            print(f"Could not refresh dashboard: {e}")
+    await query.answer("Refreshed")
 
 
 if __name__ == "__main__":

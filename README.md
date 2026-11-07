@@ -8,7 +8,7 @@ Telegram bot (Kurigram/Pyrogram) for the escrow groups.
 - **Tag notifications:** DMs users when they are @mentioned in a group (text or media captions), with a "Go to message" button. Rate-limited per tagger (`TAG_LIMIT` per `TAG_WINDOW_SECONDS`).
 
 ## Allowed group
-The bot only works in `ALLOWED_CHAT_ID` (default `-1002510674423`) and stays silent everywhere else. The owner's `/admin`, `/unadmin`, `/admins` also work in the bot's DM.
+The bot only works in `ALLOWED_CHAT_ID` (default `-1002510674423`) and automatically leaves any other group or channel it is added to. The owner's `/admin`, `/unadmin`, `/admins` also work in the bot's DM.
 
 ## Who is an admin
 - **Bot owner** (`OWNER_ID`, default `6643621069`): full access everywhere. Anonymous group admins are treated as the owner.
@@ -20,6 +20,7 @@ The bot only works in `ALLOWED_CHAT_ID` (default `-1002510674423`) and stays sil
 
 | Command | Who | What it does |
 |---|---|---|
+| `/start` (bot DM) | Bot owner | Dashboard: status, uptime, ping, bot permissions in the allowed group, filter/admin counts, activity since start, Refresh button |
 | `/admin @username` / `/admin <user id>` / reply with `/admin` | Bot owner | Makes that user a bot admin (can use all admin commands in every group) |
 | `/unadmin @username` / `<user id>` / reply | Bot owner | Removes a bot admin |
 | `/admins` | Bot owner | Lists bot admins |
