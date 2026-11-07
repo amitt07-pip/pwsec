@@ -40,11 +40,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILTERS_FILE = os.getenv("FILTERS_FILE") or os.path.join(BASE_DIR, "filters.json")
 ADMINS_FILE = os.getenv("ADMINS_FILE") or os.path.join(BASE_DIR, "admins.json")
 OWNER_ID = int(os.getenv("OWNER_ID") or "6643621069")
+ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID") or "-1002510674423")
 # ====================
 
 app = Client("join_request_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 ADMIN_STATUSES = (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
+
+
+async def _in_allowed_chat(_, __, update) -> bool:
+    message = update.message if isinstance(update, CallbackQuery) else update
+    chat = getattr(message, "chat", None)
+    return bool(chat and chat.id == ALLOWED_CHAT_ID)
+
+
+allowed_chat = filters.create(_in_allowed_chat)
 
 _bot_id = None
 _tag_history = defaultdict(deque)
@@ -240,7 +250,7 @@ async def with_flood_wait(func, *args, **kwargs):
             await asyncio.sleep(e.value + 1)
 
 
-@app.on_chat_join_request()
+@app.on_chat_join_request(allowed_chat)
 async def handle_join_request(client: Client, join_request):
     user = join_request.from_user
     chat = join_request.chat
@@ -280,7 +290,7 @@ async def handle_join_request(client: Client, join_request):
             print(f"Could not auto-approve {user.id}: {e}")
 
 
-@app.on_message(filters.command("filter") & filters.group)
+@app.on_message(filters.command("filter") & allowed_chat)
 async def add_filter(client: Client, message: Message):
     """/filter <trigger> <reply>, or reply to a message/picture with /filter <trigger> (admins only)"""
     try:
@@ -334,7 +344,7 @@ async def add_filter(client: Client, message: Message):
     await message.reply_text(f"✅ Filter saved for <b>{html.escape(trigger)}</b>", parse_mode=enums.ParseMode.HTML)
 
 
-@app.on_message(filters.command("filters") & filters.group)
+@app.on_message(filters.command("filters") & allowed_chat)
 async def list_filters(client: Client, message: Message):
     """List saved filters in this group (admins only)"""
     try:
@@ -353,7 +363,7 @@ async def list_filters(client: Client, message: Message):
     await message.reply_text(f"<b>Filters in this group:</b>\n{lines}", parse_mode=enums.ParseMode.HTML)
 
 
-@app.on_message(filters.command("stop") & filters.group)
+@app.on_message(filters.command("stop") & allowed_chat)
 async def stop_filter(client: Client, message: Message):
     """/stop <trigger> removes a filter (admins only)"""
     try:
@@ -401,7 +411,7 @@ async def resolve_target(client: Client, message: Message):
     return user.id, display_name(user)
 
 
-@app.on_message(filters.command("admin"))
+@app.on_message(filters.command("admin") & (allowed_chat | filters.private))
 async def add_bot_admin(client: Client, message: Message):
     """/admin @username | user id | reply (bot owner only)"""
     if not is_owner(message):
@@ -424,7 +434,7 @@ async def add_bot_admin(client: Client, message: Message):
     await message.reply_text(f"✅ {label} is now an admin.", parse_mode=enums.ParseMode.HTML)
 
 
-@app.on_message(filters.command("unadmin"))
+@app.on_message(filters.command("unadmin") & (allowed_chat | filters.private))
 async def remove_bot_admin(client: Client, message: Message):
     """/unadmin @username | user id | reply (bot owner only)"""
     if not is_owner(message):
@@ -447,7 +457,7 @@ async def remove_bot_admin(client: Client, message: Message):
     await message.reply_text(f"🗑 {label} is no longer an admin.", parse_mode=enums.ParseMode.HTML)
 
 
-@app.on_message(filters.command("admins"))
+@app.on_message(filters.command("admins") & (allowed_chat | filters.private))
 async def list_bot_admins(client: Client, message: Message):
     """List admins added with /admin (bot owner only)"""
     if not is_owner(message):
@@ -458,7 +468,7 @@ async def list_bot_admins(client: Client, message: Message):
     await message.reply_text("<b>Bot admins:</b>\n" + "\n".join(lines), parse_mode=enums.ParseMode.HTML)
 
 
-@app.on_message(filters.command("kickall") & filters.group)
+@app.on_message(filters.command("kickall") & allowed_chat)
 async def kick_all_members(client: Client, message: Message):
     """Ask for confirmation before kicking all non-admin members (admins with ban rights only)"""
     chat = message.chat
@@ -494,7 +504,7 @@ async def kick_all_members(client: Client, message: Message):
     )
 
 
-@app.on_callback_query(filters.regex(r"^kickall:(yes|no):(\d+)$"))
+@app.on_callback_query(filters.regex(r"^kickall:(yes|no):(\d+)$") & allowed_chat)
 async def kickall_confirm(client: Client, query: CallbackQuery):
     action, admin_id = query.matches[0].group(1), int(query.matches[0].group(2))
     message = query.message
@@ -564,7 +574,7 @@ async def kickall_confirm(client: Client, query: CallbackQuery):
     print(f"Kickall completed in {chat.title}: {kicked_count} removed, {admin_count} admins kept, {failed_count} failed")
 
 
-@app.on_message(filters.group & (filters.text | filters.caption), group=1)
+@app.on_message(allowed_chat & (filters.text | filters.caption), group=1)
 async def handle_mention(client: Client, message: Message):
     """DM users when they are tagged in a group"""
     chat = message.chat
@@ -618,7 +628,7 @@ async def handle_mention(client: Client, message: Message):
             print(f"Could not send tag notification to {mentioned_user.id}: {e}")
 
 
-@app.on_message(filters.group & (filters.text | filters.caption), group=2)
+@app.on_message(allowed_chat & (filters.text | filters.caption), group=2)
 async def reply_filters(client: Client, message: Message):
     """Reply with a saved filter when its trigger appears in a message.
     If the trigger message is itself a reply, answer the message it replied to."""
