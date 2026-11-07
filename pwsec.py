@@ -1,14 +1,16 @@
 # pwsec.py
 import asyncio
 import html
+import json
 import os
+import re
 import time
 from collections import defaultdict, deque
 
 from dotenv import load_dotenv
 from pyrogram import Client, enums, filters
 from pyrogram.errors import FloodWait
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity
 
 load_dotenv()
 
@@ -30,10 +32,11 @@ SUPPORT_LINK = os.getenv("SUPPORT_LINK") or "https://t.me/pw_supportbot"
 MAIN_CHANNEL_LINK = os.getenv("MAIN_CHANNEL_LINK") or "https://t.me/escrow_pagal"
 
 AUTO_APPROVE = os.getenv("AUTO_APPROVE", "false").lower() in ("1", "true", "yes")
-DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
 
 TAG_LIMIT = int(os.getenv("TAG_LIMIT", "5"))
 TAG_WINDOW_SECONDS = int(os.getenv("TAG_WINDOW_SECONDS", "60"))
+
+FILTERS_FILE = os.getenv("FILTERS_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "filters.json")
 # ====================
 
 app = Client("join_request_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -43,6 +46,27 @@ ADMIN_STATUSES = (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTR
 _bot_id = None
 _tag_history = defaultdict(deque)
 _kickall_running = set()
+
+
+def load_filters() -> dict:
+    try:
+        with open(FILTERS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"Could not load filters from {FILTERS_FILE}: {e}")
+        return {}
+
+
+def save_filters() -> None:
+    tmp_path = f"{FILTERS_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(_filters, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, FILTERS_FILE)
+
+
+_filters = load_filters()
 
 
 async def get_bot_id(client: Client) -> int:
@@ -88,6 +112,92 @@ async def can_ban(client: Client, chat_id: int, user_id: int) -> bool:
         member.status == enums.ChatMemberStatus.ADMINISTRATOR
         and bool(member.privileges and member.privileges.can_restrict_members)
     )
+
+
+async def is_admin(client: Client, message: Message) -> bool:
+    if message.sender_chat and message.sender_chat.id == message.chat.id:
+        return True
+    if not message.from_user:
+        return False
+    member = await client.get_chat_member(message.chat.id, message.from_user.id)
+    return member.status in ADMIN_STATUSES
+
+
+def parse_trigger(args: str):
+    """Split '"multi word" rest' or 'word rest' into (trigger, rest)."""
+    args = args.strip()
+    if args[:1] in ('"', "“"):
+        match = re.match(r'^["“](.+?)["”]\s*(.*)$', args, re.S)
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+    parts = args.split(None, 1)
+    if not parts:
+        return "", ""
+    return parts[0], parts[1].strip() if len(parts) > 1 else ""
+
+
+def command_args(message: Message) -> str:
+    text = message.text or message.caption or ""
+    parts = text.split(None, 1)
+    return parts[1] if len(parts) > 1 else ""
+
+
+def media_file_id(message: Message):
+    if not message.media:
+        return None
+    media = getattr(message, message.media.value, None)
+    return getattr(media, "file_id", None)
+
+
+ENTITY_FIELDS = ("url", "language", "custom_emoji_id", "expandable")
+
+
+def utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def serialize_entities(entities) -> list:
+    result = []
+    for entity in entities or []:
+        if entity.type in (enums.MessageEntityType.BOT_COMMAND, enums.MessageEntityType.TEXT_MENTION):
+            continue
+        data = {"type": entity.type.name, "offset": entity.offset, "length": entity.length}
+        for field in ENTITY_FIELDS:
+            value = getattr(entity, field, None)
+            if value is not None:
+                data[field] = value
+        result.append(data)
+    return result
+
+
+def shift_entities(entities, start: int) -> list:
+    shifted = []
+    for data in serialize_entities(entities):
+        if data["offset"] >= start:
+            data["offset"] -= start
+            shifted.append(data)
+    return shifted
+
+
+def deserialize_entities(entities) -> list:
+    result = []
+    for data in entities or []:
+        try:
+            result.append(
+                MessageEntity(
+                    type=enums.MessageEntityType[data["type"]],
+                    offset=data["offset"],
+                    length=data["length"],
+                    **{field: data[field] for field in ENTITY_FIELDS if field in data},
+                )
+            )
+        except Exception as e:
+            print(f"Skipping invalid saved entity {data}: {e}")
+    return result
+
+
+def trigger_matches(trigger: str, text: str) -> bool:
+    return re.search(rf"(?<!\w){re.escape(trigger)}(?!\w)", text, re.IGNORECASE) is not None
 
 
 async def with_flood_wait(func, *args, **kwargs):
@@ -137,6 +247,105 @@ async def handle_join_request(client: Client, join_request):
             print(f"Auto-approved {user.id} into {chat.title}")
         except Exception as e:
             print(f"Could not auto-approve {user.id}: {e}")
+
+
+@app.on_message(filters.command("filter") & filters.group)
+async def add_filter(client: Client, message: Message):
+    """/filter <trigger> <reply>, or reply to a message/picture with /filter <trigger> (admins only)"""
+    try:
+        if not await is_admin(client, message):
+            await message.reply_text("❌ Only admins can use this command.")
+            return
+    except Exception as e:
+        print(f"Error checking admin status: {e}")
+        return
+
+    full_text = str(message.text or message.caption or "")
+    trigger, reply_text = parse_trigger(command_args(message))
+    source = message.reply_to_message
+    file_id = None
+    entities = []
+
+    if reply_text:
+        start = len(full_text.rstrip()) - len(reply_text)
+        entities = shift_entities(message.entities or message.caption_entities, utf16_len(full_text[:start]))
+
+    if source:
+        file_id = media_file_id(source)
+        if not reply_text:
+            reply_text = str(source.text or source.caption or "")
+            entities = serialize_entities(source.entities or source.caption_entities)
+    elif message.media:
+        file_id = media_file_id(message)
+
+    usage = (
+        "<b>Usage:</b>\n"
+        "<code>/filter hello Welcome to the group!</code>\n"
+        "<code>/filter \"multi word trigger\" Reply text</code>\n"
+        "Or reply to a message/picture with <code>/filter hello</code>"
+    )
+    if not trigger or (not reply_text and not file_id):
+        await message.reply_text(usage, parse_mode=enums.ParseMode.HTML)
+        return
+
+    if source and file_id is None and source.media and not reply_text:
+        await message.reply_text("❌ That type of message can't be saved as a filter.")
+        return
+
+    chat_filters = _filters.setdefault(str(message.chat.id), {})
+    chat_filters[trigger.lower()] = {
+        "trigger": trigger,
+        "text": reply_text,
+        "entities": entities,
+        "file_id": file_id,
+    }
+    save_filters()
+    await message.reply_text(f"✅ Filter saved for <b>{html.escape(trigger)}</b>", parse_mode=enums.ParseMode.HTML)
+
+
+@app.on_message(filters.command("filters") & filters.group)
+async def list_filters(client: Client, message: Message):
+    """List saved filters in this group (admins only)"""
+    try:
+        if not await is_admin(client, message):
+            await message.reply_text("❌ Only admins can use this command.")
+            return
+    except Exception as e:
+        print(f"Error checking admin status: {e}")
+        return
+
+    chat_filters = _filters.get(str(message.chat.id), {})
+    if not chat_filters:
+        await message.reply_text("No filters saved in this group.")
+        return
+    lines = "\n".join(f"• <code>{html.escape(f['trigger'])}</code>" for f in chat_filters.values())
+    await message.reply_text(f"<b>Filters in this group:</b>\n{lines}", parse_mode=enums.ParseMode.HTML)
+
+
+@app.on_message(filters.command("stop") & filters.group)
+async def stop_filter(client: Client, message: Message):
+    """/stop <trigger> removes a filter (admins only)"""
+    try:
+        if not await is_admin(client, message):
+            await message.reply_text("❌ Only admins can use this command.")
+            return
+    except Exception as e:
+        print(f"Error checking admin status: {e}")
+        return
+
+    trigger, _ = parse_trigger(command_args(message))
+    if not trigger:
+        await message.reply_text("<b>Usage:</b> <code>/stop hello</code>", parse_mode=enums.ParseMode.HTML)
+        return
+
+    chat_filters = _filters.get(str(message.chat.id), {})
+    if chat_filters.pop(trigger.lower(), None) is None:
+        await message.reply_text(f"❌ No filter named <b>{html.escape(trigger)}</b>", parse_mode=enums.ParseMode.HTML)
+        return
+    if not chat_filters:
+        _filters.pop(str(message.chat.id), None)
+    save_filters()
+    await message.reply_text(f"🗑 Filter <b>{html.escape(trigger)}</b> removed", parse_mode=enums.ParseMode.HTML)
 
 
 @app.on_message(filters.command("kickall") & filters.group)
@@ -300,10 +509,40 @@ async def handle_mention(client: Client, message: Message):
             print(f"Could not send tag notification to {mentioned_user.id}: {e}")
 
 
-if DEBUG:
-    @app.on_message(filters.group, group=2)
-    async def debug_all_messages(client: Client, message: Message):
-        print(f"[DEBUG] Message in {message.chat.title if message.chat else 'Unknown'} (id {message.id})")
+@app.on_message(filters.group & (filters.text | filters.caption), group=2)
+async def reply_filters(client: Client, message: Message):
+    """Reply with a saved filter when its trigger appears in a message.
+    If the trigger message is itself a reply, answer the message it replied to."""
+    chat_filters = _filters.get(str(message.chat.id))
+    text = message.text or message.caption
+    if not chat_filters or not text or text.startswith("/"):
+        return
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    target = message.reply_to_message or message
+
+    for saved in chat_filters.values():
+        if not trigger_matches(saved["trigger"], text):
+            continue
+        entities = deserialize_entities(saved.get("entities"))
+        try:
+            if saved.get("file_id"):
+                await target.reply_cached_media(
+                    saved["file_id"],
+                    caption=saved.get("text") or "",
+                    caption_entities=entities or None,
+                    parse_mode=enums.ParseMode.DISABLED,
+                )
+            else:
+                await target.reply_text(
+                    saved["text"],
+                    entities=entities or None,
+                    parse_mode=enums.ParseMode.DISABLED,
+                )
+        except Exception as e:
+            print(f"Could not send filter '{saved['trigger']}' in {message.chat.id}: {e}")
+        return
 
 
 if __name__ == "__main__":
