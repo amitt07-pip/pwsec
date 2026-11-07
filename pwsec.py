@@ -36,7 +36,10 @@ AUTO_APPROVE = os.getenv("AUTO_APPROVE", "false").lower() in ("1", "true", "yes"
 TAG_LIMIT = int(os.getenv("TAG_LIMIT", "5"))
 TAG_WINDOW_SECONDS = int(os.getenv("TAG_WINDOW_SECONDS", "60"))
 
-FILTERS_FILE = os.getenv("FILTERS_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "filters.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FILTERS_FILE = os.getenv("FILTERS_FILE") or os.path.join(BASE_DIR, "filters.json")
+ADMINS_FILE = os.getenv("ADMINS_FILE") or os.path.join(BASE_DIR, "admins.json")
+OWNER_ID = int(os.getenv("OWNER_ID") or "6643621069")
 # ====================
 
 app = Client("join_request_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -48,25 +51,34 @@ _tag_history = defaultdict(deque)
 _kickall_running = set()
 
 
-def load_filters() -> dict:
+def load_json(path: str, default):
     try:
-        with open(FILTERS_FILE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        return {}
+        return default
     except Exception as e:
-        print(f"Could not load filters from {FILTERS_FILE}: {e}")
-        return {}
+        print(f"Could not load {path}: {e}")
+        return default
+
+
+def save_json(path: str, data) -> None:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
 
 
 def save_filters() -> None:
-    tmp_path = f"{FILTERS_FILE}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(_filters, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, FILTERS_FILE)
+    save_json(FILTERS_FILE, _filters)
 
 
-_filters = load_filters()
+def save_bot_admins() -> None:
+    save_json(ADMINS_FILE, sorted(_bot_admins))
+
+
+_filters = load_json(FILTERS_FILE, {})
+_bot_admins = set(load_json(ADMINS_FILE, []))
 
 
 async def get_bot_id(client: Client) -> int:
@@ -114,13 +126,32 @@ async def can_ban(client: Client, chat_id: int, user_id: int) -> bool:
     )
 
 
+def is_anonymous_admin(message: Message) -> bool:
+    return bool(message.sender_chat and message.sender_chat.id == message.chat.id)
+
+
+def is_owner(message: Message) -> bool:
+    """The bot owner, or an anonymous group admin (treated as the owner)."""
+    return is_anonymous_admin(message) or bool(message.from_user and message.from_user.id == OWNER_ID)
+
+
+def is_bot_admin(user_id: int) -> bool:
+    return user_id == OWNER_ID or user_id in _bot_admins
+
+
 async def is_admin(client: Client, message: Message) -> bool:
-    if message.sender_chat and message.sender_chat.id == message.chat.id:
+    if is_owner(message):
         return True
     if not message.from_user:
         return False
+    if is_bot_admin(message.from_user.id):
+        return True
     member = await client.get_chat_member(message.chat.id, message.from_user.id)
     return member.status in ADMIN_STATUSES
+
+
+async def can_kickall(client: Client, chat_id: int, user_id: int) -> bool:
+    return is_bot_admin(user_id) or await can_ban(client, chat_id, user_id)
 
 
 def parse_trigger(args: str):
@@ -348,20 +379,98 @@ async def stop_filter(client: Client, message: Message):
     await message.reply_text(f"🗑 Filter <b>{html.escape(trigger)}</b> removed", parse_mode=enums.ParseMode.HTML)
 
 
+async def resolve_target(client: Client, message: Message):
+    """User from a replied-to message, or from /cmd @username / user id. Returns (user_id, label) or (None, None)."""
+    if message.reply_to_message and message.reply_to_message.from_user:
+        user = message.reply_to_message.from_user
+        return user.id, display_name(user)
+
+    arg = command_args(message).strip().split(None, 1)
+    if not arg:
+        return None, None
+    arg = arg[0]
+    if arg.lstrip("-").isdigit():
+        return int(arg), f"<code>{arg}</code>"
+    try:
+        user = await client.get_users(arg.lstrip("@"))
+    except Exception as e:
+        print(f"Could not resolve {arg}: {e}")
+        return None, None
+    if isinstance(user, list) or not user:
+        return None, None
+    return user.id, display_name(user)
+
+
+@app.on_message(filters.command("admin"))
+async def add_bot_admin(client: Client, message: Message):
+    """/admin @username | user id | reply (bot owner only)"""
+    if not is_owner(message):
+        await message.reply_text("❌ Only the bot owner can use this command.")
+        return
+
+    user_id, label = await resolve_target(client, message)
+    if user_id is None:
+        await message.reply_text(
+            "<b>Usage:</b> <code>/admin @username</code>, <code>/admin 123456789</code>, or reply to a message with <code>/admin</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        return
+    if is_bot_admin(user_id):
+        await message.reply_text(f"ℹ️ {label} is already an admin.", parse_mode=enums.ParseMode.HTML)
+        return
+
+    _bot_admins.add(user_id)
+    save_bot_admins()
+    await message.reply_text(f"✅ {label} is now an admin.", parse_mode=enums.ParseMode.HTML)
+
+
+@app.on_message(filters.command("unadmin"))
+async def remove_bot_admin(client: Client, message: Message):
+    """/unadmin @username | user id | reply (bot owner only)"""
+    if not is_owner(message):
+        await message.reply_text("❌ Only the bot owner can use this command.")
+        return
+
+    user_id, label = await resolve_target(client, message)
+    if user_id is None:
+        await message.reply_text(
+            "<b>Usage:</b> <code>/unadmin @username</code>, <code>/unadmin 123456789</code>, or reply to a message with <code>/unadmin</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        return
+    if user_id not in _bot_admins:
+        await message.reply_text(f"❌ {label} is not an admin added with /admin.", parse_mode=enums.ParseMode.HTML)
+        return
+
+    _bot_admins.discard(user_id)
+    save_bot_admins()
+    await message.reply_text(f"🗑 {label} is no longer an admin.", parse_mode=enums.ParseMode.HTML)
+
+
+@app.on_message(filters.command("admins"))
+async def list_bot_admins(client: Client, message: Message):
+    """List admins added with /admin (bot owner only)"""
+    if not is_owner(message):
+        await message.reply_text("❌ Only the bot owner can use this command.")
+        return
+
+    lines = [f"👑 <code>{OWNER_ID}</code> (owner)"] + [f"• <code>{user_id}</code>" for user_id in sorted(_bot_admins)]
+    await message.reply_text("<b>Bot admins:</b>\n" + "\n".join(lines), parse_mode=enums.ParseMode.HTML)
+
+
 @app.on_message(filters.command("kickall") & filters.group)
 async def kick_all_members(client: Client, message: Message):
     """Ask for confirmation before kicking all non-admin members (admins with ban rights only)"""
     chat = message.chat
-    user = message.from_user
+    admin_id = OWNER_ID if is_anonymous_admin(message) else (message.from_user.id if message.from_user else None)
 
-    if not user:
-        await message.reply_text("❌ Anonymous admins can't use /kickall. Turn off 'Remain anonymous' and try again.")
+    if admin_id is None:
         return
 
-    print(f"[COMMAND] /kickall received in {chat.title} from {user.id}")
+    print(f"[COMMAND] /kickall received in {chat.title} from {admin_id}")
 
     try:
-        if not await can_ban(client, chat.id, user.id):
+        if not await can_kickall(client, chat.id, admin_id):
             await message.reply_text("❌ You must be an admin with 'Ban users' permission to use this command.")
             return
         if not await can_ban(client, chat.id, await get_bot_id(client)):
@@ -374,8 +483,8 @@ async def kick_all_members(client: Client, message: Message):
 
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("✅ Yes, remove all members", callback_data=f"kickall:yes:{user.id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"kickall:no:{user.id}")],
+            [InlineKeyboardButton("✅ Yes, remove all members", callback_data=f"kickall:yes:{admin_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"kickall:no:{admin_id}")],
         ]
     )
     await message.reply_text(
@@ -405,8 +514,8 @@ async def kickall_confirm(client: Client, query: CallbackQuery):
         return
 
     try:
-        if not await can_ban(client, chat.id, admin_id):
-            await query.answer("You no longer have 'Ban users' permission.", show_alert=True)
+        if not await can_kickall(client, chat.id, admin_id):
+            await query.answer("You no longer have permission to do this.", show_alert=True)
             return
     except Exception as e:
         print(f"Error checking admin status: {e}")

@@ -7,13 +7,23 @@ Telegram bot (Kurigram/Pyrogram) for the escrow groups.
 - **Filters:** when a saved trigger appears in a message (any capitals, whole word), the bot replies with the saved text or picture (formatting kept). If the trigger message is a reply to someone else's message, the bot replies to that original message instead. Stored in `filters.json` (or `FILTERS_FILE`).
 - **Tag notifications:** DMs users when they are @mentioned in a group (text or media captions), with a "Go to message" button. Rate-limited per tagger (`TAG_LIMIT` per `TAG_WINDOW_SECONDS`).
 
-## Commands (groups only)
+## Who is an admin
+- **Bot owner** (`OWNER_ID`, default `6643621069`): full access everywhere. Anonymous group admins are treated as the owner.
+- **Bot admins** added by the owner with `/admin` (saved in `admins.json`).
+- **Telegram group admins** of that group (for `/kickall`: owner or admins with "Ban users").
+
+## Commands
+`/admin`, `/unadmin`, `/admins` work in groups and in the bot's DM; the rest work in groups only.
+
 | Command | Who | What it does |
 |---|---|---|
+| `/admin @username` / `/admin <user id>` / reply with `/admin` | Bot owner | Makes that user a bot admin (can use all admin commands in every group) |
+| `/unadmin @username` / `<user id>` / reply | Bot owner | Removes a bot admin |
+| `/admins` | Bot owner | Lists bot admins |
 | `/filter <trigger> <reply>` | Admins | Saves an auto-reply. Use quotes for multi-word triggers: `/filter "how to buy" Read the pin`. Reply to a message/picture with `/filter <trigger>` (or send a picture with `/filter <trigger>` as caption) to save that instead |
 | `/filters` | Admins | Lists saved filters in the group |
 | `/stop <trigger>` | Admins | Deletes a filter |
-| `/kickall` | Owner / admins with "Ban users" | Asks for confirmation, then removes every non-admin member |
+| `/kickall` | Bot owner, bot admins, group owner, group admins with "Ban users" | Asks for confirmation, then removes every non-admin member |
 
 ## Setup
 ```bash

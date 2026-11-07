@@ -6,3 +6,5 @@ venv/
 .venv/
 filters.json
 filters.json.tmp
+admins.json
+admins.json.tmp
