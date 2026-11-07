@@ -240,7 +240,7 @@ def deserialize_entities(entities) -> list:
 
 
 def trigger_matches(trigger: str, text: str) -> bool:
-    return re.search(rf"(?<!\w){re.escape(trigger)}(?!\w)", text, re.IGNORECASE) is not None
+    return re.match(rf"\s*{re.escape(trigger)}(?!\w)", text, re.IGNORECASE) is not None
 
 
 async def with_flood_wait(func, *args, **kwargs):
@@ -634,7 +634,7 @@ async def handle_mention(client: Client, message: Message):
 
 @app.on_message(allowed_chat & (filters.text | filters.caption), group=2)
 async def reply_filters(client: Client, message: Message):
-    """Reply with a saved filter when its trigger appears in a message.
+    """Reply with a saved filter when a message starts with its trigger.
     If the trigger message is itself a reply, answer the message it replied to."""
     chat_filters = _filters.get(str(message.chat.id))
     text = message.text or message.caption
@@ -645,7 +645,7 @@ async def reply_filters(client: Client, message: Message):
 
     target = message.reply_to_message or message
 
-    for saved in chat_filters.values():
+    for saved in sorted(chat_filters.values(), key=lambda f: len(f["trigger"]), reverse=True):
         if not trigger_matches(saved["trigger"], text):
             continue
         entities = deserialize_entities(saved.get("entities"))

@@ -4,7 +4,7 @@ Telegram bot (Kurigram/Pyrogram) for the escrow groups.
 
 ## Features
 - **Join requests:** DMs anyone who requests to join with safety reminders and link buttons. Set `AUTO_APPROVE=true` to also approve them.
-- **Filters:** when a saved trigger appears in a message (any capitals, whole word), the bot replies with the saved text or picture (formatting kept). If the trigger message is a reply to someone else's message, the bot replies to that original message instead. Stored in `filters.json` (or `FILTERS_FILE`).
+- **Filters:** when a message starts with a saved trigger (any capitals, whole word; `hello there` fires `hello`, `say hello` doesn't; the longest matching trigger wins), the bot replies with the saved text or picture (formatting kept). If the trigger message is a reply to someone else's message, the bot replies to that original message instead. Stored in `filters.json` (or `FILTERS_FILE`).
 - **Tag notifications:** DMs users when they are @mentioned in a group (text or media captions), with a "Go to message" button. Rate-limited per tagger (`TAG_LIMIT` per `TAG_WINDOW_SECONDS`).
 
 ## Allowed group
