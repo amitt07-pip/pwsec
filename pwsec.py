@@ -139,12 +139,6 @@ async def handle_join_request(client: Client, join_request):
             print(f"Could not auto-approve {user.id}: {e}")
 
 
-@app.on_message(filters.command("test") & filters.group)
-async def test_command(client: Client, message: Message):
-    """Test if bot receives commands"""
-    await message.reply_text("✅ Bot is receiving commands!")
-
-
 @app.on_message(filters.command("kickall") & filters.group)
 async def kick_all_members(client: Client, message: Message):
     """Ask for confirmation before kicking all non-admin members (admins with ban rights only)"""

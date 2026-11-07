@@ -9,7 +9,6 @@ Telegram bot (Kurigram/Pyrogram) for the escrow groups.
 ## Commands (groups only)
 | Command | Who | What it does |
 |---|---|---|
-| `/test` | Anyone | Replies "✅ Bot is receiving commands!" |
 | `/kickall` | Owner / admins with "Ban users" | Asks for confirmation, then removes every non-admin member |
 
 ## Setup
