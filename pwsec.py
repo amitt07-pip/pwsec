@@ -1,224 +1,247 @@
-# join_request_bot.py
+# pwsec.py
 import asyncio
+import html
+import os
+import time
+from collections import defaultdict, deque
+
+from dotenv import load_dotenv
 from pyrogram import Client, enums, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrogram.errors import FloodWait
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+load_dotenv()
 
 # ====== CONFIG ======
-import os
+def _require_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise SystemExit(f"Missing required environment variable {name} (set it in .env)")
+    return value
 
-API_ID = int(os.getenv("API_ID", "26360975"))
-API_HASH = os.getenv("API_HASH", "6de01e30d62ce2220eea62c17485e7f7")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8224526821:AAFzB_QxKazN70rsHxohWq9ze5inh2oC0io")
-INVITE_LINK_1 = os.getenv("INVITE_LINK_1", "")
-INVITE_LINK_2 = os.getenv("INVITE_LINK_2", "")
+
+API_ID = int(_require_env("API_ID"))
+API_HASH = _require_env("API_HASH")
+BOT_TOKEN = _require_env("BOT_TOKEN")
+
+ESCROW_LINK = os.getenv("INVITE_LINK_1") or "https://t.me/+GDQdTcMu5bkwOGY1"
+CHAT_LINK = os.getenv("INVITE_LINK_2") or "https://t.me/+W2PxpjFlku0yMzFl"
+SUPPORT_LINK = os.getenv("SUPPORT_LINK") or "https://t.me/pw_supportbot"
+MAIN_CHANNEL_LINK = os.getenv("MAIN_CHANNEL_LINK") or "https://t.me/escrow_pagal"
+
+AUTO_APPROVE = os.getenv("AUTO_APPROVE", "false").lower() in ("1", "true", "yes")
+DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
+
+TAG_LIMIT = int(os.getenv("TAG_LIMIT", "5"))
+TAG_WINDOW_SECONDS = int(os.getenv("TAG_WINDOW_SECONDS", "60"))
 # ====================
 
 app = Client("join_request_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+ADMIN_STATUSES = (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
+
+_bot_id = None
+_tag_history = defaultdict(deque)
+_kickall_running = set()
+
+
+async def get_bot_id(client: Client) -> int:
+    global _bot_id
+    if _bot_id is None:
+        _bot_id = (await client.get_me()).id
+    return _bot_id
+
+
+def display_name(user) -> str:
+    if user.username:
+        return f"@{user.username}"
+    full_name = " ".join(part for part in (user.first_name, user.last_name) if part)
+    return html.escape(full_name or str(user.id))
+
+
+def message_link(message: Message):
+    chat = message.chat
+    if chat.username:
+        return f"https://t.me/{chat.username}/{message.id}"
+    chat_id = str(chat.id)
+    if chat_id.startswith("-100"):
+        return f"https://t.me/c/{chat_id[4:]}/{message.id}"
+    return None
+
+
+def tag_allowed(tagger_id: int) -> bool:
+    now = time.monotonic()
+    history = _tag_history[tagger_id]
+    while history and now - history[0] > TAG_WINDOW_SECONDS:
+        history.popleft()
+    if len(history) >= TAG_LIMIT:
+        return False
+    history.append(now)
+    return True
+
+
+async def can_ban(client: Client, chat_id: int, user_id: int) -> bool:
+    member = await client.get_chat_member(chat_id, user_id)
+    if member.status == enums.ChatMemberStatus.OWNER:
+        return True
+    return (
+        member.status == enums.ChatMemberStatus.ADMINISTRATOR
+        and bool(member.privileges and member.privileges.can_restrict_members)
+    )
+
+
+async def with_flood_wait(func, *args, **kwargs):
+    while True:
+        try:
+            return await func(*args, **kwargs)
+        except FloodWait as e:
+            print(f"FloodWait: sleeping {e.value}s")
+            await asyncio.sleep(e.value + 1)
+
+
 @app.on_chat_join_request()
-async def handle_join_request(client, join_request):
+async def handle_join_request(client: Client, join_request):
     user = join_request.from_user
     chat = join_request.chat
 
-    # Get full name (first name + last name if available)
-    full_name = user.first_name or ""
-    if user.last_name:
-        full_name = f"{full_name} {user.last_name}".strip()
-    
+    full_name = html.escape(" ".join(part for part in (user.first_name, user.last_name) if part))
+
     text = (
-        f"**Hey {full_name}**\n\n"
-        f"**You've requested to join official Crypto escrow group**\n\n"
-        f"**Please remind these things-**\n\n"
-        "• make sure to check admins username carefully before making any payment\n\n"
-        "• Make sure to Re- verify escrow group from main group of @escrow_pagal\n\n"
-        "• Dont be in hurry wait and observe escrow group activities if you found anything wrong report it to @pw_manager"
+        f"<b>Hey {full_name}</b>\n\n"
+        "<b>You've requested to join the official Crypto escrow group</b>\n\n"
+        "<b>Please remember these things:</b>\n\n"
+        "• Make sure to check admins' usernames carefully before making any payment\n\n"
+        "• Make sure to re-verify the escrow group from the main group of @escrow_pagal\n\n"
+        "• Don't be in a hurry. Wait and observe the escrow group's activities; "
+        "if you find anything wrong, report it to @pw_manager"
     )
 
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Escrow link", url="https://t.me/+GDQdTcMu5bkwOGY1")],
-            [InlineKeyboardButton("Facing issue", url="https://t.me/pw_supportbot")],
-            [InlineKeyboardButton("Main channel", url="https://t.me/escrow_pagal")],
-            [InlineKeyboardButton("👉🏻 Go to the chat", url="https://t.me/+W2PxpjFlku0yMzFl")]
+            [InlineKeyboardButton("Escrow link", url=ESCROW_LINK)],
+            [InlineKeyboardButton("Facing issue", url=SUPPORT_LINK)],
+            [InlineKeyboardButton("Main channel", url=MAIN_CHANNEL_LINK)],
+            [InlineKeyboardButton("👉🏻 Go to the chat", url=CHAT_LINK)],
         ]
     )
 
     try:
-        # Attempt to send DM
-        await client.send_message(chat_id=user.id, text=text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
-        print(f"Sent DM to {user.id} ({user.first_name}) for join request to {chat.title}")
+        await client.send_message(chat_id=user.id, text=text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
+        print(f"Sent DM to {user.id} for join request to {chat.title}")
     except Exception as e:
-        # Common errors: Bot blocked by user, user hasn't started bot, privacy restriction.
         print(f"Could not DM user {user.id}: {e}")
 
-    # OPTIONAL: Auto-approve the request after sending the DM.
-    # Uncomment the next two lines if you want automatic approval.
-    # try:
-    #     await client.approve_chat_join_request(chat_id=chat.id, user_id=user.id)
-    #     print(f"Auto-approved {user.id} into {chat.title}")
-    # except Exception as e:
-    #     print(f"Could not auto-approve {user.id}: {e}")
+    if AUTO_APPROVE:
+        try:
+            await client.approve_chat_join_request(chat_id=chat.id, user_id=user.id)
+            print(f"Auto-approved {user.id} into {chat.title}")
+        except Exception as e:
+            print(f"Could not auto-approve {user.id}: {e}")
 
-@app.on_message(filters.group & filters.text)
-async def handle_mention(client, message: Message):
-    """Handle when users are tagged/mentioned in groups"""
-    chat = message.chat
-    tagger = message.from_user
-    
-    # Skip if message is from bot itself or if there are no entities
-    if not tagger or not message.entities:
-        return
-    
-    # Check if message contains any user mentions
-    has_mention = any(
-        entity.type in [enums.MessageEntityType.MENTION, enums.MessageEntityType.TEXT_MENTION] 
-        for entity in message.entities
-    )
-    
-    if not has_mention:
-        return
-    
-    # Get the message link
-    # For public groups/channels, use username; for private, use chat_id
-    if chat.username:
-        message_link = f"https://t.me/{chat.username}/{message.id}"
-    else:
-        # For private groups, create link with chat_id
-        message_link = f"https://t.me/c/{str(chat.id)[4:]}/{message.id}"
-    
-    # Get tagger's username or first name
-    tagger_display = f"@{tagger.username}" if tagger.username else tagger.first_name
-    
-    # Find all mentioned users
-    for entity in message.entities:
-        if entity.type == enums.MessageEntityType.MENTION:
-            # Extract username from message text (includes the @)
-            username = message.text[entity.offset:entity.offset + entity.length]
-            print(f"User mentioned via @username: {username}")
-            
-            # Try to get user by username and send notification
-            try:
-                # Remove @ from username
-                username_clean = username.lstrip("@")
-                mentioned_user = await client.get_users(username_clean)
-                
-                # Format the message with bold and underline (using HTML for proper formatting)
-                text = (
-                    f"<b><u>You have been tagged</u></b>\n\n"
-                    f"<b>• From:</b> {tagger_display}\n"
-                    f"<b>• Group:</b> {chat.title}"
-                )
-                
-                keyboard = InlineKeyboardMarkup(
-                    [
-                        [InlineKeyboardButton("👉🏻 Go to message", url=message_link)]
-                    ]
-                )
-                
-                await client.send_message(
-                    chat_id=mentioned_user.id,
-                    text=text,
-                    reply_markup=keyboard,
-                    parse_mode=enums.ParseMode.HTML
-                )
-                print(f"Sent tag notification to {mentioned_user.id} ({mentioned_user.first_name}) from {chat.title}")
-            except Exception as e:
-                print(f"Could not send tag notification for {username}: {e}")
-            
-        elif entity.type == enums.MessageEntityType.TEXT_MENTION:
-            # User mentioned without public username (clicked from profile)
-            mentioned_user = entity.user
-            
-            # Format the message with bold and underline (using HTML for proper formatting)
-            text = (
-                f"<b><u>You have been tagged</u></b>\n\n"
-                f"<b>• From:</b> {tagger_display}\n"
-                f"<b>• Group:</b> {chat.title}"
-            )
-            
-            keyboard = InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("👉🏻 Go to message", url=message_link)]
-                ]
-            )
-            
-            try:
-                await client.send_message(
-                    chat_id=mentioned_user.id,
-                    text=text,
-                    reply_markup=keyboard,
-                    parse_mode=enums.ParseMode.HTML
-                )
-                print(f"Sent tag notification to {mentioned_user.id} ({mentioned_user.first_name}) from {chat.title}")
-            except Exception as e:
-                print(f"Could not send tag notification to {mentioned_user.id}: {e}")
-
-@app.on_message(filters.group)
-async def debug_all_messages(client, message: Message):
-    """Debug: Log all group messages to see if bot receives anything"""
-    print(f"[DEBUG] Message received in {message.chat.title if message.chat else 'Unknown'}: {message.text[:50] if message.text else 'No text'}")
 
 @app.on_message(filters.command("test") & filters.group)
-async def test_command(client, message: Message):
+async def test_command(client: Client, message: Message):
     """Test if bot receives commands"""
-    print(f"[TEST] Command received!")
     await message.reply_text("✅ Bot is receiving commands!")
 
+
 @app.on_message(filters.command("kickall") & filters.group)
-async def kick_all_members(client, message: Message):
-    """Kick all members from the group except admins (Admin-only command)"""
-    print(f"[COMMAND] /kickall received in {message.chat.title} from {message.from_user.first_name}")
+async def kick_all_members(client: Client, message: Message):
+    """Ask for confirmation before kicking all non-admin members (admins with ban rights only)"""
     chat = message.chat
     user = message.from_user
-    
-    # Check if the command issuer is an admin
+
+    if not user:
+        await message.reply_text("❌ Anonymous admins can't use /kickall. Turn off 'Remain anonymous' and try again.")
+        return
+
+    print(f"[COMMAND] /kickall received in {chat.title} from {user.id}")
+
     try:
-        member = await client.get_chat_member(chat.id, user.id)
-        if member.status not in [enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR]:
-            await message.reply_text("❌ You must be an admin to use this command.")
+        if not await can_ban(client, chat.id, user.id):
+            await message.reply_text("❌ You must be an admin with 'Ban users' permission to use this command.")
+            return
+        if not await can_ban(client, chat.id, await get_bot_id(client)):
+            await message.reply_text("❌ I need to be an admin with 'Ban users' permission to do this.")
             return
     except Exception as e:
         print(f"Error checking admin status: {e}")
+        await message.reply_text("❌ Could not check permissions. Try again later.")
         return
-    
-    # Send confirmation message
-    await message.reply_text("🔄 Starting to remove all members... This may take a while.")
-    
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Yes, remove all members", callback_data=f"kickall:yes:{user.id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"kickall:no:{user.id}")],
+        ]
+    )
+    await message.reply_text(
+        "⚠️ <b>This will remove ALL non-admin members from this group.</b>\n\nAre you sure?",
+        reply_markup=keyboard,
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@app.on_callback_query(filters.regex(r"^kickall:(yes|no):(\d+)$"))
+async def kickall_confirm(client: Client, query: CallbackQuery):
+    action, admin_id = query.matches[0].group(1), int(query.matches[0].group(2))
+    message = query.message
+    chat = message.chat
+
+    if query.from_user.id != admin_id:
+        await query.answer("This button isn't for you.", show_alert=True)
+        return
+
+    if action == "no":
+        await message.edit_text("❎ Kickall cancelled.")
+        await query.answer()
+        return
+
+    if chat.id in _kickall_running:
+        await query.answer("Kickall is already running in this group.", show_alert=True)
+        return
+
+    try:
+        if not await can_ban(client, chat.id, admin_id):
+            await query.answer("You no longer have 'Ban users' permission.", show_alert=True)
+            return
+    except Exception as e:
+        print(f"Error checking admin status: {e}")
+        await query.answer("Could not check permissions. Try again later.", show_alert=True)
+        return
+
+    _kickall_running.add(chat.id)
+    await message.edit_text("🔄 Removing all members... This may take a while.")
+    await query.answer()
+
     kicked_count = 0
     failed_count = 0
     admin_count = 0
-    
+
     try:
-        # Get all chat members
+        to_kick = []
         async for member in client.get_chat_members(chat.id):
-            # Skip if member is admin, owner, or creator
-            if member.status in [enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.CREATOR]:
+            if member.status in ADMIN_STATUSES:
                 admin_count += 1
-                continue
-            
-            # Skip if member is the bot itself
-            if member.user.is_bot and member.user.id == (await client.get_me()).id:
-                continue
-            
-            # Try to kick/ban and then unban the member
+            elif member.user:
+                to_kick.append(member.user.id)
+
+        for user_id in to_kick:
             try:
-                await client.ban_chat_member(chat.id, member.user.id)
-                await client.unban_chat_member(chat.id, member.user.id)
+                await with_flood_wait(client.ban_chat_member, chat.id, user_id)
+                await with_flood_wait(client.unban_chat_member, chat.id, user_id)
                 kicked_count += 1
-                print(f"Kicked {member.user.id} ({member.user.first_name}) from {chat.title}")
-                
-                # Small delay to avoid rate limiting
                 await asyncio.sleep(0.5)
             except Exception as e:
                 failed_count += 1
-                print(f"Failed to kick {member.user.id}: {e}")
-    
+                print(f"Failed to kick {user_id}: {e}")
     except Exception as e:
-        await message.reply_text(f"❌ Error during member removal: {str(e)}")
-        print(f"Error in kickall command: {e}")
+        await message.reply_text(f"❌ Error during member removal: {html.escape(str(e))}", parse_mode=enums.ParseMode.HTML)
+        print(f"Error in kickall: {e}")
         return
-    
-    # Send summary
+    finally:
+        _kickall_running.discard(chat.id)
+
     summary = (
         f"✅ <b>Kickall Complete</b>\n\n"
         f"👥 Members removed: {kicked_count}\n"
@@ -228,9 +251,69 @@ async def kick_all_members(client, message: Message):
     await message.reply_text(summary, parse_mode=enums.ParseMode.HTML)
     print(f"Kickall completed in {chat.title}: {kicked_count} removed, {admin_count} admins kept, {failed_count} failed")
 
+
+@app.on_message(filters.group & (filters.text | filters.caption), group=1)
+async def handle_mention(client: Client, message: Message):
+    """DM users when they are tagged in a group"""
+    chat = message.chat
+    tagger = message.from_user
+    text = message.text or message.caption
+    entities = message.entities or message.caption_entities
+
+    if not tagger or tagger.is_bot or not entities or text.startswith("/"):
+        return
+
+    bot_id = await get_bot_id(client)
+    notified = set()
+    link = message_link(message)
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("👉🏻 Go to message", url=link)]]) if link else None
+    notify_text = (
+        f"<b><u>You have been tagged</u></b>\n\n"
+        f"<b>• From:</b> {display_name(tagger)}\n"
+        f"<b>• Group:</b> {html.escape(chat.title or '')}"
+    )
+
+    for entity in entities:
+        mentioned_user = None
+        try:
+            if entity.type == enums.MessageEntityType.MENTION:
+                username = text[entity.offset:entity.offset + entity.length].lstrip("@")
+                mentioned_user = await client.get_users(username)
+            elif entity.type == enums.MessageEntityType.TEXT_MENTION:
+                mentioned_user = entity.user
+        except Exception as e:
+            print(f"Could not resolve mention: {e}")
+            continue
+
+        if not mentioned_user or isinstance(mentioned_user, list):
+            continue
+        if mentioned_user.id in notified or mentioned_user.id in (tagger.id, bot_id) or mentioned_user.is_bot:
+            continue
+        if not tag_allowed(tagger.id):
+            print(f"Tag rate limit hit for {tagger.id}")
+            return
+
+        notified.add(mentioned_user.id)
+        try:
+            await client.send_message(
+                chat_id=mentioned_user.id,
+                text=notify_text,
+                reply_markup=keyboard,
+                parse_mode=enums.ParseMode.HTML,
+            )
+            print(f"Sent tag notification to {mentioned_user.id} from {chat.title}")
+        except Exception as e:
+            print(f"Could not send tag notification to {mentioned_user.id}: {e}")
+
+
+if DEBUG:
+    @app.on_message(filters.group, group=2)
+    async def debug_all_messages(client: Client, message: Message):
+        print(f"[DEBUG] Message in {message.chat.title if message.chat else 'Unknown'} (id {message.id})")
+
+
 if __name__ == "__main__":
-    print("Starting join_request_bot...")
-    print(f"Monitoring mentions and join requests...")
+    print("Starting pwsec bot...")
     print("IMPORTANT: Make sure the bot has 'Privacy Mode' DISABLED in @BotFather")
     print("           and the bot is an admin in your groups!")
     app.run()
