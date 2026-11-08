@@ -1,0 +1,10 @@
+.env
+*.session
+*.session-journal
+__pycache__/
+venv/
+.venv/
+filters.json
+filters.json.tmp
+admins.json
+admins.json.tmp
