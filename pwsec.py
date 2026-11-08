@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 
 from dotenv import load_dotenv
 from pyrogram import Client, enums, filters
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, UserNotParticipant
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity
 
 load_dotenv()
@@ -60,7 +60,9 @@ _bot_id = None
 _tag_history = defaultdict(deque)
 _kickall_running = set()
 START_TIME = time.time()
-_stats = {"join_dms": 0, "tag_dms": 0, "filter_replies": 0, "groups_left": 0}
+_stats = {"join_dms": 0, "tag_dms": 0, "filter_replies": 0, "groups_left": 0, "kick": 0, "ban": 0, "unban": 0, "purged": 0}
+CLEANUP_DELAY = int(os.getenv("CLEANUP_DELAY") or "5")
+_cleanup_tasks = set()
 
 
 def load_json(path: str, default):
@@ -507,6 +509,151 @@ async def kick_all_members(client: Client, message: Message):
     )
 
 
+def schedule_cleanup(client: Client, chat_id: int, *message_ids) -> None:
+    """Delete the given messages after CLEANUP_DELAY seconds."""
+    ids = [message_id for message_id in message_ids if message_id]
+
+    async def cleanup():
+        await asyncio.sleep(CLEANUP_DELAY)
+        try:
+            await client.delete_messages(chat_id, ids)
+        except Exception as e:
+            print(f"Could not delete messages {ids} in {chat_id}: {e}")
+
+    task = asyncio.create_task(cleanup())
+    _cleanup_tasks.add(task)
+    task.add_done_callback(_cleanup_tasks.discard)
+
+
+async def has_admin_right(client: Client, chat_id: int, user_id: int, right: str) -> bool:
+    member = await client.get_chat_member(chat_id, user_id)
+    if member.status == enums.ChatMemberStatus.OWNER:
+        return True
+    return member.status == enums.ChatMemberStatus.ADMINISTRATOR and bool(
+        member.privileges and getattr(member.privileges, right, False)
+    )
+
+
+async def can_moderate(client: Client, message: Message, right: str) -> bool:
+    """Owner, bot admins, or group admins holding the given right."""
+    if is_owner(message):
+        return True
+    if not message.from_user:
+        return False
+    return is_bot_admin(message.from_user.id) or await has_admin_right(client, message.chat.id, message.from_user.id, right)
+
+
+def moderation_reason(message: Message) -> str:
+    args = command_args(message).strip()
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return args
+    parts = args.split(None, 1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+MODERATION_DONE = {"kick": "👢 {label} was kicked.", "ban": "🔨 {label} was banned.", "unban": "✅ {label} was unbanned."}
+
+
+async def run_moderation(client: Client, message: Message, action: str) -> str:
+    chat_id = message.chat.id
+    if not await can_moderate(client, message, "can_restrict_members"):
+        return "❌ You must be an admin with 'Ban users' permission to use this command."
+    bot_id = await get_bot_id(client)
+    if not await has_admin_right(client, chat_id, bot_id, "can_restrict_members"):
+        return "❌ I need to be an admin with 'Ban users' permission to do this."
+
+    user_id, label = await resolve_target(client, message)
+    if user_id is None:
+        return (
+            f"<b>Usage:</b> <code>/{action} @username [reason]</code>, <code>/{action} 123456789 [reason]</code>, "
+            f"or reply to a message with <code>/{action} [reason]</code>"
+        )
+
+    if action != "unban":
+        if user_id in (bot_id, OWNER_ID) or is_bot_admin(user_id):
+            return f"❌ I can't {action} that user."
+        try:
+            member = await client.get_chat_member(chat_id, user_id)
+            if member.status in ADMIN_STATUSES:
+                return f"❌ I can't {action} a group admin."
+        except UserNotParticipant:
+            if action == "kick":
+                return f"ℹ️ {label} is not in this group."
+        except Exception as e:
+            print(f"Could not check member {user_id}: {e}")
+
+    try:
+        if action in ("kick", "ban"):
+            await with_flood_wait(client.ban_chat_member, chat_id, user_id)
+        if action in ("kick", "unban"):
+            await with_flood_wait(client.unban_chat_member, chat_id, user_id)
+    except Exception as e:
+        print(f"/{action} {user_id} failed in {chat_id}: {e}")
+        return f"❌ Could not {action} {label}: {html.escape(str(e))}"
+
+    _stats[action] += 1
+    print(f"[COMMAND] /{action} {user_id} in {chat_id}")
+    text = MODERATION_DONE[action].format(label=label)
+    reason = moderation_reason(message)
+    if reason:
+        text += f"\n<b>Reason:</b> {html.escape(reason)}"
+    return text
+
+
+@app.on_message(filters.command(["kick", "ban", "unban"]) & allowed_chat)
+async def moderate_member(client: Client, message: Message):
+    """/kick, /ban, /unban @username | user id | reply [reason]; command and reply are deleted afterwards"""
+    action = message.command[0].lower()
+    try:
+        text = await run_moderation(client, message, action)
+    except Exception as e:
+        print(f"/{action} error: {e}")
+        text = "❌ Something went wrong. Try again later."
+    try:
+        sent = await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
+    except Exception as e:
+        print(f"Could not reply to /{action}: {e}")
+        sent = None
+    schedule_cleanup(client, message.chat.id, message.id, sent.id if sent else None)
+
+
+async def run_purge(client: Client, message: Message) -> str:
+    chat_id = message.chat.id
+    if not await can_moderate(client, message, "can_delete_messages"):
+        return "❌ You must be an admin with 'Delete messages' permission to use this command."
+    if not await has_admin_right(client, chat_id, await get_bot_id(client), "can_delete_messages"):
+        return "❌ I need to be an admin with 'Delete messages' permission to do this."
+    if not message.reply_to_message:
+        return "<b>Usage:</b> reply to the first message you want to delete with <code>/purge</code>"
+
+    message_ids = list(range(message.reply_to_message.id, message.id + 1))
+    deleted = 0
+    for i in range(0, len(message_ids), 100):
+        try:
+            deleted += await with_flood_wait(client.delete_messages, chat_id, message_ids[i : i + 100]) or 0
+        except Exception as e:
+            print(f"/purge batch failed in {chat_id}: {e}")
+    _stats["purged"] += deleted
+    print(f"[COMMAND] /purge deleted {deleted} messages in {chat_id}")
+    return f"🧹 Purged {deleted} messages."
+
+
+@app.on_message(filters.command("purge") & allowed_chat)
+async def purge_messages(client: Client, message: Message):
+    """Reply to a message with /purge to delete everything from it up to the command"""
+    try:
+        text = await run_purge(client, message)
+    except Exception as e:
+        print(f"/purge error: {e}")
+        text = "❌ Something went wrong. Try again later."
+    try:
+        sent = await client.send_message(message.chat.id, text, parse_mode=enums.ParseMode.HTML)
+    except Exception as e:
+        print(f"Could not send /purge result: {e}")
+        sent = None
+    schedule_cleanup(client, message.chat.id, message.id, sent.id if sent else None)
+
+
 @app.on_callback_query(filters.regex(r"^kickall:(yes|no):(\d+)$") & allowed_chat)
 async def kickall_confirm(client: Client, query: CallbackQuery):
     action, admin_id = query.matches[0].group(1), int(query.matches[0].group(2))
@@ -721,13 +868,14 @@ async def build_dashboard(client: Client) -> str:
         member = await client.get_chat_member(ALLOWED_CHAT_ID, await get_bot_id(client))
         privileges = member.privileges
         is_group_admin = member.status in ADMIN_STATUSES
-        healthy = is_group_admin and bool(privileges and privileges.can_restrict_members and privileges.can_invite_users)
+        healthy = is_group_admin and bool(privileges and privileges.can_restrict_members and privileges.can_invite_users and privileges.can_delete_messages)
         group_lines = [
             f"<b>• Name:</b> {html.escape(chat.title or '')}",
             f"<b>• ID:</b> <code>{ALLOWED_CHAT_ID}</code>",
             f"<b>• Bot is admin:</b> {yes_no(is_group_admin)}",
             f"<b>• Ban users:</b> {yes_no(privileges and privileges.can_restrict_members)}",
             f"<b>• Invite users / join requests:</b> {yes_no(privileges and privileges.can_invite_users)}",
+            f"<b>• Delete messages:</b> {yes_no(privileges and privileges.can_delete_messages)}",
         ]
     except Exception as e:
         healthy = False
@@ -755,6 +903,8 @@ async def build_dashboard(client: Client) -> str:
             f"<b>• Join request DMs:</b> {_stats['join_dms']}",
             f"<b>• Tag DMs:</b> {_stats['tag_dms']}",
             f"<b>• Filter replies:</b> {_stats['filter_replies']}",
+            f"<b>• Kicks / bans / unbans:</b> {_stats['kick']} / {_stats['ban']} / {_stats['unban']}",
+            f"<b>• Messages purged:</b> {_stats['purged']}",
             f"<b>• Groups left:</b> {_stats['groups_left']}",
             "",
             f"<i>Updated {time.strftime('%Y-%m-%d %H:%M:%S')}</i>",

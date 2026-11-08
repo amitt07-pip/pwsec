@@ -28,6 +28,12 @@ The bot only works in `ALLOWED_CHAT_ID` (default `-1002510674423`) and automatic
 | `/filters` | Admins | Lists saved filters in the group |
 | `/stop <trigger>` | Admins | Deletes a filter |
 | `/kickall` | Bot owner, bot admins, group owner, group admins with "Ban users" | Asks for confirmation, then removes every non-admin member |
+| `/kick @username` / `/kick <user id>` / reply with `/kick` (+ optional reason) | Bot owner, bot admins, group admins with "Ban users" | Removes the user (they can rejoin) |
+| `/ban @username` / `/ban <user id>` / reply with `/ban` (+ optional reason) | Same | Bans the user |
+| `/unban @username` / `/unban <user id>` / reply with `/unban` | Same | Unbans the user |
+| Reply to a message with `/purge` | Bot owner, bot admins, group admins with "Delete messages" | Deletes every message from that one up to the command |
+
+After `/kick`, `/ban`, `/unban` and `/purge`, the command and the bot's response are deleted after `CLEANUP_DELAY` seconds (default 5). The owner, bot admins and group admins can't be kicked or banned.
 
 ## Setup
 ```bash
@@ -35,4 +41,4 @@ pip install -r requirements.txt
 cp .env.example .env   # fill in API_ID, API_HASH, BOT_TOKEN
 python pwsec.py
 ```
-The bot must be an admin in your groups (with "Ban users" for `/kickall`, "Invite users" for join requests), and Privacy Mode must be disabled in @BotFather.
+The bot must be an admin in your groups (with "Ban users" for `/kickall`/`/kick`/`/ban`/`/unban`, "Delete messages" for `/purge` and cleanup, "Invite users" for join requests), and Privacy Mode must be disabled in @BotFather.
